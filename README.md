@@ -31,6 +31,13 @@ uv run prepare.py    # one-time data download + tokenizer
 uv run train.py      # ~6 min (5 min training + compile/eval)
 ```
 
+Training logs are tracked with [Weights & Biases](https://wandb.ai) (offline by default, no account needed). Pass `--no-wandb` to disable. To view runs in the cloud dashboard:
+
+```bash
+uv run wandb login           # one-time setup
+uv run wandb sync wandb/offline-run-*
+```
+
 Then point Claude Code (or any agent) at `program.md` and let it run experiments autonomously.
 
 ## Three files that matter

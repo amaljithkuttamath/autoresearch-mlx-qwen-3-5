@@ -46,6 +46,8 @@ Each experiment runs on Apple Silicon via MLX. The training script runs for a **
 - Install new packages or add dependencies. You can only use what's already in `pyproject.toml`.
 - Modify the evaluation harness. The `evaluate_bpb` function in `prepare.py` is the ground truth metric.
 
+**Logging**: Always pass `--no-wandb` during autonomous runs to avoid accumulating log directories.
+
 **The goal is simple: get the lowest val_bpb.** Since the time budget is fixed, you don't need to worry about training time. Everything is fair game: change the architecture, the optimizer, the hyperparameters, the batch size, the model size, the layer pattern. The only constraint is that the code runs without crashing and finishes within the time budget.
 
 **Memory** is a soft constraint. MLX uses unified memory. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
@@ -133,7 +135,7 @@ LOOP FOREVER:
 1. Look at the git state: the current branch/commit we're on
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. `git add train.py && git commit -m "experiment: <description>"`
-4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything -- do NOT use tee or let output flood your context)
+4. Run the experiment: `uv run train.py --no-wandb > run.log 2>&1` (redirect everything -- do NOT use tee or let output flood your context)
 5. Read out the results: `/usr/bin/grep "^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (do not commit results.tsv, leave it untracked)
