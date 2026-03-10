@@ -370,8 +370,10 @@ class Qwen35(nn.Module):
                 dn.in_proj_a.weight = mx.random.uniform(-scale, scale, dn.in_proj_a.weight.shape).astype(mx.bfloat16)
                 dn.in_proj_z.weight = mx.random.uniform(-scale, scale, dn.in_proj_z.weight.shape).astype(mx.bfloat16)
                 dn.out_proj.weight = mx.zeros_like(dn.out_proj.weight).astype(mx.bfloat16)
-                dn.A_log = mx.log(mx.random.uniform(0.1, 16.0, dn.A_log.shape))
-                dn.dt_bias = mx.ones(dn.dt_bias.shape)
+                dn.A_log = mx.log(mx.random.uniform(low=0.0, high=16.0, shape=dn.A_log.shape))
+                # Log-uniform dt_bias init (official GatedDeltaNet): softplus(dt_bias) ~ [0.001, 0.1]
+                dt = mx.exp(mx.random.uniform(shape=dn.dt_bias.shape) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
+                dn.dt_bias = dt + mx.log(-mx.expm1(-dt))  # inverse softplus
 
     def _get_mask(self, seq_len):
         if seq_len not in self._mask_cache:
@@ -539,7 +541,7 @@ MATRIX_LR = 0.04
 SCALAR_LR = 0.5
 WEIGHT_DECAY = 0.2
 ADAM_BETAS = (0.8, 0.95)
-WARMUP_RATIO = 0.0
+WARMUP_RATIO = 0.01
 WARMDOWN_RATIO = 0.5
 FINAL_LR_FRAC = 0.0
 
@@ -635,6 +637,14 @@ while True:
 
     if grad_accum_steps > 1:
         accum_grads = tree_map(lambda grad: grad * (1.0 / grad_accum_steps), accum_grads)
+
+    # Gradient clipping
+    grad_norm_sq = sum(mx.sum(g * g).item() for _, g in tree_flatten(accum_grads))
+    grad_norm = grad_norm_sq ** 0.5
+    max_grad_norm = 1.0
+    if grad_norm > max_grad_norm:
+        clip_scale = max_grad_norm / grad_norm
+        accum_grads = tree_map(lambda g: g * clip_scale, accum_grads)
 
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
