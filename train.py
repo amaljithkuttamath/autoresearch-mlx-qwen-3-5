@@ -7,6 +7,7 @@ Usage: uv run train.py
 import gc
 import math
 import os
+import sys
 import time
 from dataclasses import dataclass
 
@@ -17,6 +18,77 @@ from mlx.utils import tree_flatten, tree_map
 from prepare import MAX_SEQ_LEN, TIME_BUDGET, Tokenizer, evaluate_bpb, make_dataloader
 
 os.environ["HF_HUB_DISABLE_PROGRESS_BARS"] = "1"
+
+try:
+    import wandb
+    USE_WANDB = "--wandb" in sys.argv  # opt-in: pass --wandb to enable
+    if USE_WANDB:
+        os.environ.setdefault("WANDB_MODE", "offline")
+except ImportError:
+    wandb = None
+    USE_WANDB = False
+
+VERBOSE = "--verbose" in sys.argv
+VERBOSE_INTERVAL = 50  # log tensor stats every N steps (always log on NaN)
+_verbose_this_step = False  # set per-step
+
+# ---------------------------------------------------------------------------
+# Logging: writes to logs/<timestamp>.jsonl when --verbose
+# ---------------------------------------------------------------------------
+import json
+from datetime import datetime
+
+_log_file = None
+_log_step = 0
+
+if VERBOSE:
+    os.makedirs("logs", exist_ok=True)
+    _run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+    _log_path = f"logs/{_run_id}.jsonl"
+    _log_file = open(_log_path, "w")
+    print(f"Verbose logging to {_log_path}")
+
+
+def _log_event(event_type, data):
+    """Append a JSON line to the log file."""
+    if _log_file is None:
+        return
+    record = {"step": _log_step, "type": event_type, **data}
+    _log_file.write(json.dumps(record) + "\n")
+    _log_file.flush()
+
+
+def _ts(name, x):
+    """Tensor stats: name, shape, min/max/mean/has_nan. Only runs on verbose steps."""
+    if not _verbose_this_step:
+        return
+    x_eval = mx.array(x)
+    mx.eval(x_eval)
+    flat = x_eval.reshape(-1).astype(mx.float32)
+    has_nan = bool(mx.any(mx.isnan(flat)).item())
+    has_inf = bool(mx.any(mx.isinf(flat)).item())
+    mn = float(flat.min().item()) if not has_nan else float("nan")
+    mx_val = float(flat.max().item()) if not has_nan else float("nan")
+    mean = float(mx.mean(flat).item()) if not has_nan else float("nan")
+    flag = ""
+    if has_nan:
+        flag = " *** NaN ***"
+    elif has_inf:
+        flag = " *** Inf ***"
+    print(f"  [{name}] shape={list(x.shape)} min={mn:.4g} max={mx_val:.4g} mean={mean:.4g}{flag}")
+    _log_event("tensor", {
+        "name": name, "shape": list(x.shape),
+        "min": mn, "max": mx_val, "mean": mean,
+        "has_nan": has_nan, "has_inf": has_inf,
+    })
+
+
+def _scalar(name, val):
+    """Log a scalar value. Only runs on verbose steps."""
+    if not _verbose_this_step:
+        return
+    print(f"  [{name}] = {val}")
+    _log_event("scalar", {"name": name, "value": val})
 
 
 # ---------------------------------------------------------------------------
@@ -330,8 +402,9 @@ class GatedDeltaNet(nn.Module):
 
         return out
 
-    def __call__(self, x):
+    def __call__(self, x, _layer_idx=None):
         B, T, _ = x.shape
+        _lid = f"DN-L{_layer_idx}" if _layer_idx is not None else "DN"
 
         # Project to QKV
         mixed = self.in_proj_qkv(x)  # (B, T, conv_dim)
@@ -357,8 +430,17 @@ class GatedDeltaNet(nn.Module):
         # Compute beta (write strength) and g (decay)
         beta = mx.sigmoid(self.in_proj_b(x))  # (B, T, num_heads)
         a = self.in_proj_a(x)  # (B, T, num_heads)
-        A = -mx.exp(self.A_log.astype(mx.float32))
+        # Clamp A_log to prevent decay coefficient explosion (init range is [0, 2.77])
+        A_log_clamped = mx.clip(self.A_log.astype(mx.float32), 0.0, 4.0)
+        A = -mx.exp(A_log_clamped)
         g = A * nn.softplus(a.astype(mx.float32) + self.dt_bias)  # (B, T, num_heads)
+
+        _ts(f"{_lid}/A_log", self.A_log)
+        _ts(f"{_lid}/A(decay_coeff)", A)
+        _ts(f"{_lid}/dt_bias", self.dt_bias)
+        _ts(f"{_lid}/g(log_decay)", g)
+        _ts(f"{_lid}/beta", beta)
+        _ts(f"{_lid}/v_pre_chunk", v)
 
         # Output gate
         z = self.in_proj_z(x)  # (B, T, value_dim)
@@ -371,7 +453,8 @@ class GatedDeltaNet(nn.Module):
         beta_f = beta.astype(mx.float32)
         g_f = g.astype(mx.float32)
 
-        core_out = self._chunk_forward(q_f, k_f, v_f, beta_f, g_f, chunk_size=64)
+        core_out = mx.checkpoint(self._chunk_forward)(q_f, k_f, v_f, beta_f, g_f, chunk_size=64)
+        _ts(f"{_lid}/chunk_out", core_out)
 
         # Reshape for gated norm: norm operates per-head on last dim
         core_out_flat = core_out.reshape(B * T * self.num_heads, self.head_dim)
@@ -379,8 +462,11 @@ class GatedDeltaNet(nn.Module):
         z_flat = z_heads.reshape(B * T * self.num_heads, self.head_dim)
         core_out_flat = self.norm(core_out_flat, z_flat)
         core_out = core_out_flat.reshape(B, T, self.value_dim)
+        _ts(f"{_lid}/gated_norm_out", core_out)
 
-        return self.out_proj(core_out)
+        final_out = self.out_proj(core_out)
+        _ts(f"{_lid}/final_out", final_out)
+        return final_out
 
 
 # ---------------------------------------------------------------------------
@@ -390,6 +476,7 @@ class GatedDeltaNet(nn.Module):
 class Block(nn.Module):
     def __init__(self, config, layer_idx, layer_type):
         super().__init__()
+        self.layer_idx = layer_idx
         self.layer_type = layer_type
         if layer_type == "F":
             self.attn = FullAttention(config)
@@ -403,8 +490,9 @@ class Block(nn.Module):
         if self.layer_type == "F":
             x = x + self.attn(self.norm1(x), mask)
         else:
-            x = x + self.attn(self.norm1(x))
+            x = x + self.attn(self.norm1(x), _layer_idx=self.layer_idx)
         x = x + self.mlp(self.norm2(x))
+        _ts(f"block{self.layer_idx}({self.layer_type})/out", x)
         return x
 
 
@@ -475,11 +563,14 @@ class Qwen35(nn.Module):
         mask = self._get_mask(seq_len)
 
         x = self.wte(idx)
+        _ts("embed_out", x)
         for block in self.blocks:
             x = block(x, mask)
         x = self.final_norm(x)
+        _ts("final_norm_out", x)
 
         logits = self.lm_head(x).astype(mx.float32)
+        _ts("logits", logits)
 
         if targets is None:
             return logits
@@ -488,10 +579,13 @@ class Qwen35(nn.Module):
         targets_safe = mx.where(valid, targets, mx.zeros_like(targets))
         ce = nn.losses.cross_entropy(logits, targets_safe, reduction="none")
         ce = ce * valid
+        _ts("ce_per_token", ce)
         if reduction == "none":
             return ce
         denom = mx.maximum(mx.sum(valid), 1)
-        return mx.sum(ce) / denom
+        loss = mx.sum(ce) / denom
+        _scalar("loss", float(loss.item()) if VERBOSE else "")
+        return loss
 
 
 # ---------------------------------------------------------------------------
@@ -499,7 +593,7 @@ class Qwen35(nn.Module):
 # ---------------------------------------------------------------------------
 
 class AdamW:
-    def __init__(self, model, unembedding_lr, embedding_lr, matrix_lr, weight_decay, adam_betas, scalar_lr):
+    def __init__(self, model, unembedding_lr, embedding_lr, matrix_lr, weight_decay, adam_betas, scalar_lr, decay_lr):
         self.param_config = {}
         self.adam_state = {}
 
@@ -529,8 +623,16 @@ class AdamW:
                     "eps": 1e-10,
                     "weight_decay": 0.0,
                 }
+            elif "A_log" in path or "dt_bias" in path:
+                # Decay params live inside exp() -- need lower LR
+                self.param_config[path] = {
+                    "lr": decay_lr,
+                    "betas": adam_betas,
+                    "eps": 1e-10,
+                    "weight_decay": 0.0,
+                }
             else:
-                # Scalar params (norms, A_log, dt_bias, conv_weight, etc.)
+                # Norm weights, conv_weight, etc.
                 self.param_config[path] = {
                     "lr": scalar_lr,
                     "betas": adam_betas,
@@ -628,7 +730,8 @@ TOTAL_BATCH_SIZE = 2**13  # 8192 tokens per optimizer step
 EMBEDDING_LR = 0.6
 UNEMBEDDING_LR = 0.004
 MATRIX_LR = 0.04
-SCALAR_LR = 0.5
+SCALAR_LR = 0.04
+DECAY_LR = 0.04  # A_log, dt_bias -- clamped to [0,4], safe at same LR
 WEIGHT_DECAY = 0.2
 ADAM_BETAS = (0.8, 0.95)
 WARMUP_RATIO = 0.01
@@ -693,9 +796,26 @@ optimizer = AdamW(
     weight_decay=WEIGHT_DECAY,
     adam_betas=ADAM_BETAS,
     scalar_lr=SCALAR_LR,
+    decay_lr=DECAY_LR,
 )
 
 loss_grad_fn = nn.value_and_grad(model, lambda model, inputs, targets: model(inputs, targets=targets))
+
+if USE_WANDB:
+    wandb.init(
+        project="autoresearch-mlx",
+        config={
+            "n_embd": N_EMBD, "n_head": N_HEAD, "head_dim": HEAD_DIM,
+            "depth": DEPTH, "layer_pattern": LAYER_PATTERN,
+            "total_batch_size": TOTAL_BATCH_SIZE, "seq_len": MAX_SEQ_LEN,
+            "matrix_lr": MATRIX_LR, "embedding_lr": EMBEDDING_LR,
+            "unembedding_lr": UNEMBEDDING_LR, "scalar_lr": SCALAR_LR,
+            "decay_lr": DECAY_LR, "weight_decay": WEIGHT_DECAY,
+            "adam_betas": ADAM_BETAS, "warmup_ratio": WARMUP_RATIO,
+            "warmdown_ratio": WARMDOWN_RATIO, "time_budget": TIME_BUDGET,
+            "num_params_M": num_params / 1e6,
+        },
+    )
 
 print(f"Architecture: Qwen3.5-style hybrid ({LAYER_PATTERN})")
 print(f"Parameters: {num_params / 1e6:.1f}M")
@@ -707,10 +827,27 @@ total_training_time = 0.0
 step = 0
 t_compiled = None
 
+# Log run config for reproducibility
+_log_event("config", {
+    "layer_pattern": LAYER_PATTERN, "n_embd": N_EMBD, "n_head": N_HEAD,
+    "head_dim": HEAD_DIM, "depth": DEPTH, "batch_size": TOTAL_BATCH_SIZE,
+    "matrix_lr": MATRIX_LR, "scalar_lr": SCALAR_LR, "decay_lr": DECAY_LR, "embedding_lr": EMBEDDING_LR,
+    "weight_decay": WEIGHT_DECAY, "warmup_ratio": WARMUP_RATIO,
+    "num_params_M": num_params / 1e6,
+})
+
+_prev_loss_was_nan = False
+
 while True:
+    _log_step = step
+    # Log on first 3 steps, every VERBOSE_INTERVAL, and the step after a NaN
+    _verbose_this_step = VERBOSE and (step < 3 or step % VERBOSE_INTERVAL == 0 or _prev_loss_was_nan)
     t0 = time.time()
     accum_grads = None
     train_loss = None
+
+    if _verbose_this_step:
+        print(f"\n{'='*60}\nSTEP {step} FORWARD PASS\n{'='*60}")
 
     for _ in range(grad_accum_steps):
         loss, grads = loss_grad_fn(model, x, y)
@@ -732,17 +869,39 @@ while True:
     grad_norm_sq = sum(mx.sum(g * g).item() for _, g in tree_flatten(accum_grads))
     grad_norm = grad_norm_sq ** 0.5
     max_grad_norm = 1.0
-    if grad_norm > max_grad_norm:
-        clip_scale = max_grad_norm / grad_norm
-        accum_grads = tree_map(lambda g: g * clip_scale, accum_grads)
 
+    # Per-parameter grad norms (verbose only)
+    if _verbose_this_step:
+        print(f"\n--- step {step} grad diagnostics ---")
+        _scalar("grad_norm_total", f"{grad_norm:.4g}")
+        grad_norms = {}
+        for path, g in tree_flatten(accum_grads):
+            gnorm = float(mx.sum(g.astype(mx.float32) * g.astype(mx.float32)).item()) ** 0.5
+            has_nan = bool(mx.any(mx.isnan(g)).item())
+            flag = " *** NaN ***" if has_nan else ""
+            if has_nan or gnorm > 0.1 * grad_norm or "A_log" in path or "dt_bias" in path or "out_proj" in path:
+                print(f"  [grad/{path}] norm={gnorm:.6e}{flag}")
+            grad_norms[path] = gnorm if not has_nan else "nan"
+        _log_event("grads", {"grad_norm": grad_norm, "per_param": grad_norms})
+
+    # Skip update if loss or gradients are NaN
+    train_loss_f = float(train_loss.item())
     progress = min(total_training_time / TIME_BUDGET, 1.0)
     lrm = get_lr_multiplier(progress)
-    optimizer.set_lr_multiplier(lrm)
-    optimizer.update(model, accum_grads)
-    mx.eval(model.parameters(), *optimizer.state)
+    _prev_loss_was_nan = math.isnan(grad_norm) or math.isnan(train_loss_f)
+    if _prev_loss_was_nan:
+        if VERBOSE:
+            print(f"  *** SKIPPING UPDATE: loss={train_loss_f}, grad_norm={grad_norm} ***")
+        mx.eval(model.parameters())  # still need to eval to keep graph in sync
+    else:
+        if grad_norm > max_grad_norm:
+            clip_scale = max_grad_norm / grad_norm
+            accum_grads = tree_map(lambda g: g * clip_scale, accum_grads)
 
-    train_loss_f = float(train_loss.item())
+        optimizer.set_lr_multiplier(lrm)
+        optimizer.update(model, accum_grads)
+        mx.eval(model.parameters(), *optimizer.state)
+
     if train_loss_f > 100:
         print("FAIL")
         raise SystemExit(1)
@@ -752,11 +911,26 @@ while True:
         total_training_time += dt
 
     ema_beta = 0.9
-    smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
+    if not math.isnan(train_loss_f):
+        smooth_train_loss = ema_beta * smooth_train_loss + (1 - ema_beta) * train_loss_f
     debiased_smooth_loss = smooth_train_loss / (1 - ema_beta ** (step + 1))
     pct_done = 100 * progress
     tok_per_sec = int(TOTAL_BATCH_SIZE / dt) if dt > 0 else 0
     remaining = max(0.0, TIME_BUDGET - total_training_time)
+
+    _log_event("step", {
+        "loss_raw": train_loss_f, "loss_smooth": debiased_smooth_loss,
+        "grad_norm": grad_norm, "lrm": lrm, "dt_ms": dt * 1000,
+        "tok_per_sec": tok_per_sec, "skipped": math.isnan(grad_norm) or math.isnan(train_loss_f),
+    })
+
+    if USE_WANDB:
+        wandb.log({
+            "loss": train_loss_f, "loss_smooth": debiased_smooth_loss,
+            "grad_norm": grad_norm, "lr_multiplier": lrm,
+            "step_ms": dt * 1000, "tok_per_sec": tok_per_sec,
+            "epoch": epoch,
+        }, step=step)
 
     print(
         f"\rstep {step:05d} ({pct_done:.1f}%) | loss: {debiased_smooth_loss:.6f} | "
@@ -790,6 +964,20 @@ print(f"Final eval completed in {t_eval - t_train:.1f}s")
 
 steady_state_mfu = 0.0
 peak_vram_mb = get_peak_memory_mb()
+
+_log_event("result", {
+    "val_bpb": val_bpb, "training_seconds": total_training_time,
+    "total_seconds": t_eval - t_start, "peak_vram_mb": peak_vram_mb,
+    "total_tokens_M": total_tokens / 1e6, "num_steps": step,
+})
+if _log_file is not None:
+    _log_file.close()
+    print(f"Verbose log saved to {_log_path}")
+
+if USE_WANDB:
+    wandb.log({"val_bpb": val_bpb, "peak_vram_mb": peak_vram_mb,
+               "total_tokens_M": total_tokens / 1e6, "training_seconds": total_training_time})
+    wandb.finish()
 
 print("---")
 print(f"val_bpb:          {val_bpb:.6f}")

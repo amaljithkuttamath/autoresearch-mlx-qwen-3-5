@@ -12,9 +12,11 @@ The model uses a Qwen3.5-inspired architecture:
 - **RMSNorm**: (1 + weight) scaling with zero-init
 - **No**: value embeddings, residual lambdas, logit capping
 
-Default config: 4 layers, 256 embed dim, 4 heads, 64 head dim, ~21M total params (~4M non-embedding).
+Default config: 4 layers, 256 embed dim, 4 heads, 64 head dim, ~8.3M params (vocab_size=8192).
 
-**Important constraint**: The recurrent DeltaNet loop is slow at long sequences. On M4 Pro 24GB, DEVICE_BATCH_SIZE=4 gives ~3.8s/step (~78 steps in 5 min). Batch size 16 is too slow (~85s/step). Keep DEVICE_BATCH_SIZE at 4 or lower unless you find a way to speed up the recurrent loop. Memory budget is 24GB unified -- leave headroom for the OS.
+**Performance**: DeltaNet uses chunk-wise processing (chunk_size=64), not step-by-step recurrence. On M4 Pro 24GB, DEVICE_BATCH_SIZE=4 gives ~345ms/step (~820 steps in 5 min). Larger batch sizes may be feasible. Memory budget is 24GB unified -- leave headroom for the OS (~5GB peak VRAM at current config).
+
+**Numerical stability**: `A_log` (decay parameter) is clamped to [0, 4] to prevent `exp(A_log)` overflow. The optimizer uses separate learning rate groups: `DECAY_LR` for `A_log`/`dt_bias` (inside exp, sensitive to large updates) and `SCALAR_LR` for norm weights. NaN loss/grad steps are automatically skipped.
 
 ## Setup
 
@@ -48,7 +50,7 @@ Each experiment runs on Apple Silicon via MLX. The training script runs for a **
 
 **Memory** is a soft constraint. MLX uses unified memory. Some increase is acceptable for meaningful val_bpb gains, but it should not blow up dramatically.
 
-**Speed matters.** The recurrent DeltaNet is the bottleneck. More optimizer steps generally means better results. If you find a way to speed up the DeltaNet (chunked processing, reduced head dim, fewer DeltaNet layers), that frees up more steps. Trade-off: fewer DeltaNet layers means less linear attention benefit, but more steps.
+**Speed matters.** More optimizer steps generally means better results. The DeltaNet chunk-wise forward is already fast (~345ms/step at batch=4). To get more steps: reduce model size, reduce head_dim, or increase batch efficiency. Trade-off: fewer DeltaNet layers means less linear attention benefit, but more steps.
 
 **Simplicity criterion**: All else being equal, simpler is better. A small improvement that adds ugly complexity is not worth it. Removing something and getting equal or better results is a simplification win.
 
@@ -76,8 +78,8 @@ These are suggestions, not prescriptions. The agent should generate its own idea
 - **Batch size**: Try DEVICE_BATCH_SIZE=2 for even more steps
 
 **Speed optimizations:**
-- **Smaller DeltaNet**: head_dim=32, heads=2 makes the recurrence 4x cheaper
-- **Fewer DeltaNet layers**: LLLF -> LF or LLF, then use the extra speed for more steps or larger model
+- **Smaller DeltaNet**: head_dim=32, heads=2 reduces chunk computation
+- **Fewer DeltaNet layers**: LLLF -> LF or LLF, then use the extra capacity for larger model dim
 
 **Note on FINAL_EVAL_BATCH_SIZE**: Currently set to 4 (same as DEVICE_BATCH_SIZE). If eval results seem noisy between runs, this may need increasing, but it will slow down the eval phase.
 
@@ -94,15 +96,17 @@ peak_vram_mb:     XXXXX.X
 mfu_percent:      0.00
 total_tokens_M:   XX.X
 num_steps:        XX
-num_params_M:     21.0
+num_params_M:     8.3
 depth:            4
 ```
 
-Extract the key metric from the log file:
+Extract the key metrics from the log file:
 
 ```
-grep "^val_bpb:\|^peak_vram_mb:" run.log
+/usr/bin/grep "^val_bpb:\|^peak_vram_mb:" run.log
 ```
+
+Note: Use `/usr/bin/grep` explicitly since some environments alias `grep` to `rg` which uses different syntax.
 
 ## Logging results
 
@@ -130,13 +134,13 @@ LOOP FOREVER:
 2. Tune `train.py` with an experimental idea by directly hacking the code.
 3. `git add train.py && git commit -m "experiment: <description>"`
 4. Run the experiment: `uv run train.py > run.log 2>&1` (redirect everything -- do NOT use tee or let output flood your context)
-5. Read out the results: `grep "^val_bpb:\|^peak_vram_mb:" run.log`
+5. Read out the results: `/usr/bin/grep "^val_bpb:\|^peak_vram_mb:" run.log`
 6. If the grep output is empty, the run crashed. Run `tail -n 50 run.log` to read the Python stack trace and attempt a fix. If you can't get things to work after more than a few attempts, give up.
 7. Record the results in the tsv (do not commit results.tsv, leave it untracked)
 8. If val_bpb improved (lower), you "advance" the branch, keeping the git commit
 9. If val_bpb is equal or worse, you git reset back to where you started
 
-**Timeout**: Each experiment should take ~6 minutes total (5 min training + ~1 min compile/eval). With the recurrent DeltaNet, some experiments may take longer if batch size is increased. If a run exceeds 15 minutes, kill it and treat it as a failure (discard and revert).
+**Timeout**: Each experiment should take ~6 minutes total (5 min training + ~1 min compile/eval). If a run exceeds 15 minutes, kill it and treat it as a failure (discard and revert).
 
 **Crashes**: If a run crashes (OOM, or a bug, or etc.), use your judgment: If it's something dumb and easy to fix, fix it and re-run. If the idea itself is fundamentally broken, skip it, log "crash" as the status in the tsv, and move on.
 

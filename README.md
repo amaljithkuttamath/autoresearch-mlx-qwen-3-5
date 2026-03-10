@@ -14,13 +14,13 @@ Based on [autoresearch-mlx](https://github.com/trevin-creator/autoresearch-mlx) 
 - SwiGLU MLP (gate/up/down, 3.5x expansion)
 - RMSNorm with (1+w) scaling, zero-init
 - Gated Q projection on full attention layers
-- Recurrent delta rule with causal conv1d on linear attention layers
+- Chunk-wise delta rule with causal conv1d on linear attention layers
 - QK-norm (RMSNorm for full attn, L2 for DeltaNet)
-- ~21M total parameters (~4M non-embedding) at default config
+- ~8.3M params at default config (vocab_size=8192)
 
 ## Hardware
 
-Developed and tested on M4 Pro 24GB. DEVICE_BATCH_SIZE=4 gives ~3.8s/step (~78 steps in 5 min).
+Developed and tested on M4 Pro 24GB. DEVICE_BATCH_SIZE=4 gives ~345ms/step (~820 steps in 5 min).
 
 ## Quick start
 
