@@ -549,9 +549,8 @@ class Qwen35(nn.Module):
                 dn.in_proj_z.weight = mx.random.uniform(-scale, scale, dn.in_proj_z.weight.shape).astype(mx.bfloat16)
                 dn.out_proj.weight = mx.zeros_like(dn.out_proj.weight).astype(mx.bfloat16)
                 dn.A_log = mx.log(mx.random.uniform(low=1.0, high=16.0, shape=dn.A_log.shape))
-                # Log-uniform dt_bias init (official GatedDeltaNet): softplus(dt_bias) ~ [0.001, 0.1]
-                dt = mx.exp(mx.random.uniform(shape=dn.dt_bias.shape) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
-                dn.dt_bias = dt + mx.log(-mx.expm1(-dt))  # inverse softplus
+                # Official Qwen3.5: dt_bias = ones
+                dn.dt_bias = mx.ones(dn.dt_bias.shape)
 
     def _get_mask(self, seq_len):
         if seq_len not in self._mask_cache:
