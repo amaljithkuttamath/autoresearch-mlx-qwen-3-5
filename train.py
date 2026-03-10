@@ -91,7 +91,7 @@ def l2norm(x, eps=1e-6):
     return x * mx.rsqrt(mx.sum(x * x, axis=-1, keepdims=True) + eps)
 
 
-def create_additive_causal_mask(seq_len, dtype=mx.float32):
+def create_additive_causal_mask(seq_len, dtype=mx.bfloat16):
     indices = mx.arange(seq_len)
     blocked = indices[None, :] > indices[:, None]
     return mx.where(blocked, mx.array(float("-inf"), dtype=dtype), mx.array(0.0, dtype=dtype))
@@ -211,6 +211,125 @@ class GatedDeltaNet(nn.Module):
             out = out + x_padded[:, :, self.conv_kernel_size - 1 - k:self.conv_kernel_size - 1 - k + T] * w
         return nn.silu(out)
 
+    @staticmethod
+    def _chunk_forward(q, k, v, beta, g, chunk_size=64):
+        """
+        Chunk-wise gated delta rule, faithful port of FLA naive_chunk_gated_delta_rule.
+
+        Args:
+            q, k: (B, T, H, D_k) -- l2-normalized, q already scaled by 1/sqrt(d)
+            v:    (B, T, H, D_v)
+            beta: (B, T, H)
+            g:    (B, T, H) -- log-space decay (negative values)
+
+        Returns:
+            output: (B, T, H, D_v)
+        """
+        B, T, H, D = q.shape
+        C = chunk_size
+
+        # Pre-scale v by beta and compute k_beta (FLA convention)
+        v = v * beta[:, :, :, None]
+        k_beta = k * beta[:, :, :, None]
+
+        # Pad T to multiple of C
+        pad_len = (C - T % C) % C
+        if pad_len > 0:
+            q = mx.pad(q, [(0, 0), (0, pad_len), (0, 0), (0, 0)])
+            k = mx.pad(k, [(0, 0), (0, pad_len), (0, 0), (0, 0)])
+            v = mx.pad(v, [(0, 0), (0, pad_len), (0, 0), (0, 0)])
+            k_beta = mx.pad(k_beta, [(0, 0), (0, pad_len), (0, 0), (0, 0)])
+            g = mx.pad(g, [(0, 0), (0, pad_len), (0, 0)])
+
+        T_pad = T + pad_len
+        nc = T_pad // C
+
+        # Transpose to (B, H, T, D) then reshape to (B, H, nc, C, D)
+        q = q.transpose(0, 2, 1, 3).reshape(B, H, nc, C, D)
+        k = k.transpose(0, 2, 1, 3).reshape(B, H, nc, C, D)
+        v = v.transpose(0, 2, 1, 3).reshape(B, H, nc, C, D)
+        k_beta = k_beta.transpose(0, 2, 1, 3).reshape(B, H, nc, C, D)
+        g = g.transpose(0, 2, 1).reshape(B, H, nc, C)  # (B, H, nc, C)
+
+        # Cumulative decay within each chunk
+        g_cumsum = mx.cumsum(g, axis=-1)  # (B, H, nc, C)
+        decay_exp = mx.exp(g_cumsum)[:, :, :, :, None]  # (B, H, nc, C, 1)
+
+        # Intra-chunk decay mask: L[i,j] = exp(g_cumsum[i] - g_cumsum[j]) for i >= j
+        g_i = g_cumsum[:, :, :, :, None]  # (B,H,nc,C,1)
+        g_j = g_cumsum[:, :, :, None, :]  # (B,H,nc,1,C)
+        # Mask BEFORE exp to avoid inf: upper triangle diffs can be large positive
+        tri = mx.tri(C, C, k=0)
+        L_diff = (g_i - g_j) * tri  # zero out upper triangle before exp
+        L_mask = mx.exp(L_diff) * tri
+
+        # WY matrix (FLA: attn): A = -(k_beta @ k^T) * L_mask, upper triangle zeroed
+        A = -(k_beta @ k.transpose(0, 1, 2, 4, 3)) * L_mask
+        # Zero the diagonal and upper triangle (FLA uses masked_fill with triu(diagonal=0))
+        A = A * mx.tri(C, C, k=-1)
+
+        # Triangular solve (FLA in-place row update, here functional)
+        A_rows = [A[:, :, :, 0:1, :]]
+        for i in range(1, C):
+            row_i = A[:, :, :, i:i+1, :]
+            prev = mx.concatenate(A_rows, axis=-2)
+            correction = row_i[:, :, :, :, :i] @ prev
+            A_rows.append(row_i + correction)
+        attn_solved = mx.concatenate(A_rows, axis=-2) + mx.eye(C)
+
+        # FLA pre-computes corrected v and corrected decayed keys for ALL chunks
+        # k_cumsum = attn @ v  (WY-corrected values)
+        # k_cumdecay = attn @ (k_beta * decay_exp)  (WY-corrected decayed keys)
+        v_corrected = attn_solved @ v          # (B, H, nc, C, D)
+        k_cumdecay = attn_solved @ (k_beta * decay_exp)  # (B, H, nc, C, D)
+
+        # Upper-triangle mask for intra-chunk attention (zero future positions)
+        upper_mask = mx.tri(C, C, k=0)  # lower triangular = 1
+
+        # Per-chunk recurrence
+        state = mx.zeros((B, H, D, D))  # (B, H, D_k, D_v)
+        outputs = []
+
+        for c in range(nc):
+            q_c = q[:, :, c]              # (B, H, C, D)
+            k_c = k[:, :, c]
+            v_c = v_corrected[:, :, c]     # WY-corrected, beta-scaled values
+            kcd_c = k_cumdecay[:, :, c]    # WY-corrected decayed keys
+
+            # Inter-chunk: retrieve from state using corrected decayed keys
+            v_prime = kcd_c @ state  # (B,H,C,D) @ (B,H,D,D) -> (B,H,C,D)
+            v_new = v_c - v_prime
+
+            # Intra-chunk attention
+            g_c = g_cumsum[:, :, c]  # (B, H, C)
+            o_intra = (q_c @ k_c.transpose(0, 1, 3, 2) * L_mask[:, :, c]) * upper_mask
+            # FLA uses masked_fill with triu(diagonal=1) to zero upper triangle
+            # L_mask already has lower-tri structure, so multiply by upper_mask is redundant
+            # but we keep it for safety
+            o_intra = o_intra @ v_new
+
+            # Inter-chunk: read from state with decay
+            q_decayed = q_c * mx.exp(g_c)[:, :, :, None]
+            o_inter = q_decayed @ state
+
+            outputs.append(o_intra + o_inter)
+
+            # State update
+            g_last = g_cumsum[:, :, c, -1:]  # (B, H, 1)
+            decay_state = mx.exp(g_last)[:, :, :, None]  # (B, H, 1, 1)
+            g_rel = (g_last[:, :, :, None] - g_c[:, :, :, None])  # (B,H,C,1)
+            k_decayed = k_c * mx.exp(g_rel)
+            state = state * decay_state + k_decayed.transpose(0, 1, 3, 2) @ v_new
+
+        # Reassemble: (B, H, nc, C, D) -> (B, T, H, D)
+        out = mx.stack(outputs, axis=2)
+        out = out.reshape(B, H, T_pad, D).transpose(0, 2, 1, 3)  # (B, T_pad, H, D)
+
+        if pad_len > 0:
+            out = out[:, :T]
+
+        return out
+
     def __call__(self, x):
         B, T, _ = x.shape
 
@@ -244,44 +363,15 @@ class GatedDeltaNet(nn.Module):
         # Output gate
         z = self.in_proj_z(x)  # (B, T, value_dim)
 
-        # Recurrent delta rule: step by step over T
-        # State: (B, num_heads, head_dim, head_dim)
+        # Chunk-wise delta rule (FLA convention)
         scale = 1.0 / math.sqrt(self.head_dim)
-
-        # Convert to float32 for recurrence
         q_f = (q * scale).astype(mx.float32)
         k_f = k.astype(mx.float32)
         v_f = v.astype(mx.float32)
         beta_f = beta.astype(mx.float32)
         g_f = g.astype(mx.float32)
 
-        state = mx.zeros((B, self.num_heads, self.head_dim, self.head_dim))
-        outputs = []
-
-        for t in range(T):
-            q_t = q_f[:, t]  # (B, H, D)
-            k_t = k_f[:, t]  # (B, H, D)
-            v_t = v_f[:, t]  # (B, H, D)
-            g_t = mx.exp(g_f[:, t])[:, :, None, None]  # (B, H, 1, 1)
-            beta_t = beta_f[:, t][:, :, None]  # (B, H, 1)
-
-            # Decay state
-            state = state * g_t
-
-            # Delta rule: retrieve, compute error, write
-            # retrieved = state @ k_t (einsum: bhdk, bhk -> bhd)
-            retrieved = mx.sum(state * k_t[:, :, None, :], axis=-1)  # (B, H, D)
-            delta = (v_t - retrieved) * beta_t  # (B, H, D)
-
-            # Write: state += k_t outer delta (einsum: bhk, bhd -> bhkd)
-            state = state + k_t[:, :, :, None] * delta[:, :, None, :]
-
-            # Read: output = state @ q_t
-            out_t = mx.sum(state * q_t[:, :, None, :], axis=-1)  # (B, H, D)
-            outputs.append(out_t)
-
-        # Stack outputs: (B, T, H, D)
-        core_out = mx.stack(outputs, axis=1)
+        core_out = self._chunk_forward(q_f, k_f, v_f, beta_f, g_f, chunk_size=64)
 
         # Reshape for gated norm: norm operates per-head on last dim
         core_out_flat = core_out.reshape(B * T * self.num_heads, self.head_dim)
@@ -370,7 +460,7 @@ class Qwen35(nn.Module):
                 dn.in_proj_a.weight = mx.random.uniform(-scale, scale, dn.in_proj_a.weight.shape).astype(mx.bfloat16)
                 dn.in_proj_z.weight = mx.random.uniform(-scale, scale, dn.in_proj_z.weight.shape).astype(mx.bfloat16)
                 dn.out_proj.weight = mx.zeros_like(dn.out_proj.weight).astype(mx.bfloat16)
-                dn.A_log = mx.log(mx.random.uniform(low=0.0, high=16.0, shape=dn.A_log.shape))
+                dn.A_log = mx.log(mx.random.uniform(low=1.0, high=16.0, shape=dn.A_log.shape))
                 # Log-uniform dt_bias init (official GatedDeltaNet): softplus(dt_bias) ~ [0.001, 0.1]
                 dt = mx.exp(mx.random.uniform(shape=dn.dt_bias.shape) * (math.log(0.1) - math.log(0.001)) + math.log(0.001))
                 dn.dt_bias = dt + mx.log(-mx.expm1(-dt))  # inverse softplus

@@ -338,7 +338,7 @@ def evaluate_bpb(model, tokenizer, batch_size):
         nbytes = mx.take(token_bytes, y_flat, axis=0)
         mask = nbytes > 0
         total_nats += mx.sum(loss_flat * mask).item()
-        total_bytes += int(mx.sum(nbytes).item())
+        total_bytes += int(mx.sum(nbytes * mask).item())
 
     if total_bytes == 0:
         return float("inf")
